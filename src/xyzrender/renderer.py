@@ -158,7 +158,8 @@ def render_svg(graph, config: RenderConfig | None = None, *, _log: bool = True) 
         f'<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" '
         f'width="{canvas_w}" height="{canvas_h}">'
     ]
-    svg.append(f'  <rect width="100%" height="100%" fill="{cfg.background}"/>')
+    if not cfg.transparent:
+        svg.append(f'  <rect width="100%" height="100%" fill="{cfg.background}"/>')
 
     use_grad = cfg.gradient
     if use_grad:
