@@ -103,10 +103,10 @@ def main() -> None:
     style_g.add_argument("-s", "--atom-stroke-width", type=float, default=None)
     style_g.add_argument("--bond-color", default=None, help="Bond color (hex or named)")
     style_g.add_argument("-B", "--background", default=None)
-    style_g.add_argument("--transparent", action=argparse.BooleanOptionalAction, default=False, help="Transparent background")
+    style_g.add_argument("-t", "--transparent", action="store_true", help="Transparent background")
     style_g.add_argument("-G", "--gradient-strength", type=float, default=None, help="Gradient contrast")
     style_g.add_argument("--grad", action=argparse.BooleanOptionalAction, default=None, help="Radial gradients")
-    style_g.add_argument("-F", "--fog-strength", type=float, default=None)
+    style_g.add_argument("-F", "--fog-strength", type=float, default=None, help="Fog strength")
     style_g.add_argument("--vdw-opacity", type=float, default=None, help="VdW sphere opacity")
     style_g.add_argument("--vdw-scale", type=float, default=None, help="VdW sphere radius scale")
     style_g.add_argument("--vdw-gradient", type=float, default=None, help="VdW sphere gradient strength")
@@ -172,6 +172,62 @@ def main() -> None:
     gif_g.add_argument("--gif-fps", type=int, default=10, help="GIF frames per second (default: 10)")
     gif_g.add_argument("--rot-frames", type=int, default=120, help="Rotation frames (default: 120)")
 
+    # --- Measurements & annotations ---
+    annot_g = p.add_argument_group("measurements & annotations")
+    annot_g.add_argument(
+        "--label-size", type=float, default=None, metavar="PT", help="Label font size (overrides preset)"
+    )
+    annot_g.add_argument(
+        "--measure",
+        nargs="*",
+        default=None,
+        metavar="TYPE",
+        help="Print bond measurements to stdout: d (distances), a (angles), t (dihedrals). "
+        "Combine: --measure d a. Omit types for all.",
+    )
+    annot_g.add_argument(
+        "--idx",
+        nargs="?",
+        const="sn",
+        default=None,
+        metavar="FMT",
+        help="Label all atoms with index in SVG: sn (C1, default), s (C only), n (number only)",
+    )
+    annot_g.add_argument(
+        "-l",
+        dest="label_specs",
+        nargs="+",
+        action="append",
+        default=None,
+        metavar="TOKEN",
+        help=(
+            "Annotate SVG (repeatable): "
+            '"-l 1 2 d" (bond distance), "-l 2 a" (all angles at atom 2), '
+            '"-l 1 2 3 4 t" (dihedral polyline), "-l 1 +0.5" (custom atom label), '
+            '"-l 1 2 NBO" (custom bond label). Indices 1-based.'
+        ),
+    )
+    annot_g.add_argument(
+        "--label",
+        default=None,
+        metavar="FILE",
+        help="Annotation file (same spec syntax as -l, one per line, # comments, comma or space separated)",
+    )
+    annot_g.add_argument(
+        "--cmap",
+        default=None,
+        metavar="FILE",
+        help="Atom property colormap file: two columns (1-indexed atom index, value); header lines are skipped",
+    )
+    annot_g.add_argument(
+        "--cmap-range",
+        nargs=2,
+        type=float,
+        default=None,
+        metavar=("VMIN", "VMAX"),
+        help="Explicit colormap range (default: auto from file values)",
+    )
+
     args = p.parse_args()
     from xyzrender import configure_logging
 
@@ -193,6 +249,7 @@ def main() -> None:
         ("background", "background"),
         ("vdw_opacity", "vdw_opacity"),
         ("vdw_scale", "vdw_scale"),
+        ("label_size", "label_font_size"),
     ]:
         val = getattr(args, attr)
         if val is not None:
@@ -243,6 +300,15 @@ def main() -> None:
         p.error(f"Unsupported static output format: .{static_ext} (use {supported})")
 
     wants_gif = args.gif_ts or args.gif_rot or args.gif_trj
+
+    # Warn when annotation flags (static-SVG only) are combined with GIF output
+    annotation_flags_used = args.idx is not None or args.label_specs or args.label
+    if annotation_flags_used and wants_gif:
+        print(
+            "Warning: --idx, -l and --label apply to static SVG output only and will not appear in the GIF.",
+            file=sys.stderr,
+        )
+
     if args.rot_frames != 120 and not args.gif_rot:
         logger.warning("--rot-frames ignored without --gif-rot")
     if args.gif_ts and args.gif_trj:
@@ -250,6 +316,10 @@ def main() -> None:
             "--gif-ts and --gif-trj are mutually exclusive. "
             "Use --gif-trj with --ts if you want TS bonds shown in the trj gif"
         )
+
+    if args.transparent and args.background is not None:
+        logger.warning("--transparent and --background are mutually exclusive; using transparent")
+        args.background = None
 
     is_cube = args.input and args.input.endswith(".cube")
 
@@ -309,6 +379,49 @@ def main() -> None:
     # Post-load analysis
     if args.nci:
         graph = detect_nci(graph)
+
+    # Measurements (terminal only — no SVG effect)
+    if args.measure is not None:
+        from xyzrender.measure import print_measurements
+
+        modes = args.measure if args.measure else ["all"]  # bare --measure means all
+        valid_modes = {"all", "d", "a", "t", "tor", "dih"}
+        for m in modes:
+            if m.lower() not in valid_modes:
+                p.error(f"--measure: unknown type {m!r} (valid: d, a, t, or omit for all)")
+        print_measurements(graph, modes)
+
+    # Atom index labels in SVG
+    if args.idx is not None:
+        valid_fmts = {"sn", "s", "n"}
+        if args.idx not in valid_fmts:
+            p.error(f"--idx: unknown format {args.idx!r} (valid: sn, s, n)")
+        cfg.show_indices = True
+        cfg.idx_format = args.idx
+
+    # SVG annotations (-l / --label)
+    if args.label_specs or args.label:
+        from xyzrender.annotations import parse_annotations
+
+        try:
+            cfg.annotations = parse_annotations(
+                inline_specs=args.label_specs or [],
+                file_path=args.label,
+                graph=graph,
+            )
+        except (ValueError, FileNotFoundError) as e:
+            p.error(str(e))
+
+    # Atom property colormap
+    if args.cmap:
+        from xyzrender.annotations import load_cmap
+
+        try:
+            cfg.atom_cmap = load_cmap(args.cmap, graph)
+        except (ValueError, FileNotFoundError) as e:
+            p.error(str(e))
+        if args.cmap_range is not None:
+            cfg.cmap_range = tuple(args.cmap_range)
 
     # Orientation
     if args.interactive:
